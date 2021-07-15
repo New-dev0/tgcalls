@@ -103,13 +103,12 @@ class TelethonBridge(MTProtoBridgeBase):
         if not self.full_chat.call or not self.my_ssrc:
             return
 
-        response = await self.client(
+        return await self.client(
             functions.phone.LeaveGroupCallRequest(call=self.full_chat.call, source=int_ssrc(self.my_ssrc))
         )
-        await self.client.handle_updates(response)
 
     async def edit_group_call_member(self, peer, volume: int = None, muted=False):
-        response = await self.client(
+        return await self.client(
             functions.phone.EditGroupCallParticipantRequest(
                 call=self.full_chat.call,
                 participant=peer,
@@ -117,10 +116,9 @@ class TelethonBridge(MTProtoBridgeBase):
                 volume=volume,
             )
         )
-        await self.client.handle_updates(response)
 
     async def get_and_set_self_peer(self):
-        self.my_peer = await self.client.get_input_peer("me")
+        self.my_peer = types.InputPeerSelf()
 
         return self.my_peer
 
@@ -178,7 +176,7 @@ class TelethonBridge(MTProtoBridgeBase):
 
     async def join_group_call(self, invite_hash: str, params: str, muted: bool):
         try:
-            response = await self.client(
+            return await self.client(
                 functions.phone.JoinGroupCallRequest(
                     call=self.group_call,
                     join_as=self.join_as,
@@ -187,8 +185,6 @@ class TelethonBridge(MTProtoBridgeBase):
                     muted=muted,
                 )
             )
-
-            await self.client.handle_updates(response)
         except TelethonGroupcallSsrcDuplicateMuch as e:
             raise GroupcallSsrcDuplicateMuch(e.x)
 
