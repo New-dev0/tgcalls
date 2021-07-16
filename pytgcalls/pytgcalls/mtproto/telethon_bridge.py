@@ -49,9 +49,9 @@ class TelethonBridge(MTProtoBridgeBase):
         }
 
         self._handler_group = None
-        self._update_handler = events.Raw(self._process_update)
+        self._update_handler = self._process_update
 
-    async def _process_update(self, _, update, users, chats):
+    async def _process_update(self, update):
         if type(update) not in self._update_to_handler.keys():  # TODO or not self.__native_instance:
             return
 
@@ -159,7 +159,7 @@ class TelethonBridge(MTProtoBridgeBase):
             self._handler_group = -self.group_call.id
         self._handler_group = self.group_call.id
 
-        self.client.add_event_handler(self._update_handler, self._handler_group)
+        self.client.add_event_handler(self._update_handler)
 
     async def resolve_and_set_join_as(self, join_as):
         my_peer = await self.get_and_set_self_peer()
