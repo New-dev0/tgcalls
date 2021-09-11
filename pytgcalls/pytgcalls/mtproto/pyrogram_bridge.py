@@ -202,7 +202,7 @@ class PyrogramBridge(MTProtoBridgeBase):
                 self.join_as = await self.client.resolve_peer(get_peer_id(self.join_as))
             else:
                 self.join_as = my_peer
-        elif isinstance(join_as, str) or isinstance(join_as, int):
+        elif isinstance(join_as, (str, int)):
             self.join_as = await self.client.resolve_peer(join_as)
         else:
             self.join_as = join_as
