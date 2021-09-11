@@ -130,9 +130,12 @@ class GroupCallBase(ABC, GroupCallBaseDispatcherMixin, GroupCallNative):
 
             # maybe (if needed) set unmute status on server side after allowing to speak by admin
             # also mb there is need a some delay after getting update cuz server sometimes cant handle editing properly
-            if participant.is_self and participant.can_self_unmute:
-                if not self._is_muted:
-                    await self.edit_group_call(muted=False)
+            if (
+                participant.is_self
+                and participant.can_self_unmute
+                and not self._is_muted
+            ):
+                await self.edit_group_call(muted=False)
 
             if participant.peer == self.mtproto.join_as and ssrc != self.mtproto.my_ssrc:
                 logger.debug(f'Not equal ssrc. Expected: {ssrc}. Actual: {self.mtproto.my_ssrc}.')
