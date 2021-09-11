@@ -106,14 +106,14 @@ class PyrogramBridge(MTProtoBridgeBase):
         return in_group_call
 
     async def get_my_volume(self):
-        if not self.full_chat or not self.full_chat.call or not self.my_ssrc or self.my_peer:
+        if not self.full_chat or not self.full_chat.call or not self.my_peer:
             return
 
         response = await self.client.send(
             functions.phone.GetGroupParticipants(
                 call=self.full_chat.call,
                 ids=[self.my_peer],
-                sources=[int_ssrc(self.my_ssrc)],
+                sources=[],
                 offset="",
                 limit=1,
             )
