@@ -116,7 +116,7 @@ class TelethonBridge(MTProtoBridgeBase):
             functions.phone.GetGroupParticipantsRequest(
                 call=self.full_chat.call,
                 ids=["me"],
-                sources=int_ssrc(self.my_ssrc),
+                sources=[int_ssrc(self.my_ssrc)],
                 offset="",
                 limit=1
             )
