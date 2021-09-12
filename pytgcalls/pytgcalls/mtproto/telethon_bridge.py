@@ -116,7 +116,8 @@ class TelethonBridge(MTProtoBridgeBase):
                 call=self.full_chat.call, ids=participants, sources=sources, offset=offset, limit=limit
             )
         )
-        return response.participants
+        participants = [GroupCallParticipantWrapper.create(p) for p in response.participants]
+        return participants
 
     async def leave_current_group_call(self):
         if not self.full_chat or not self.full_chat.call or not self.my_ssrc:
