@@ -17,402 +17,248 @@
 #  You should have received a copy of the GNU Lesser General Public License v3
 #  along with tgcalls. If not, see <http://www.gnu.org/licenses/>.
 
-import asyncio
-import logging
-from abc import ABC
+from enum import Enum
 from typing import Callable, Optional
 
-import tgcalls
-
 from pytgcalls.dispatcher import Action, DispatcherMixin
-from pytgcalls.exceptions import GroupCallNotFoundError, NotConnectedError
-from pytgcalls.implementation import GroupCallNative
-from pytgcalls.mtproto.data import GroupCallDiscardedWrapper
-from pytgcalls.mtproto.data.update import UpdateGroupCallParticipantsWrapper, UpdateGroupCallWrapper
-from pytgcalls.mtproto.exceptions import GroupcallSsrcDuplicateMuch
-from pytgcalls.utils import uint_ssrc
-
-logger = logging.getLogger(__name__)
+from pytgcalls.implementation import GroupCallRaw, GroupCallBaseAction
+from pytgcalls.utils import AudioStream, VideoStream
 
 
-class GroupCallAction:
-    NETWORK_STATUS_CHANGED = Action()
-    '''When a status of network will be changed.'''
-    PARTICIPANT_LIST_UPDATED = Action()
-    '''When a list of participant will be updated.'''
+class MediaType(Enum):
+    VIDEO = 'video'
+    AUDIO = 'audio'
+
+
+class GroupCallAction(GroupCallBaseAction):
+    VIDEO_PLAYOUT_ENDED = Action()
+    '''When a video playout will be ended.'''
+    AUDIO_PLAYOUT_ENDED = Action()
+    '''When a audio playout will be ended.'''
+    PLAYOUT_ENDED = MEDIA_PLAYOUT_ENDED = Action()
+    '''When a audio or video playout will be ended.'''
 
 
 class GroupCallDispatcherMixin(DispatcherMixin):
-    def on_network_status_changed(self, func: Callable) -> Callable:
-        """When a status of network will be changed.
+    def on_video_playout_ended(self, func: Callable) -> Callable:
+        """When a video playout will be ended.
 
         Args:
-            func (`Callable`): A functions that accept group_call and is_connected args.
+            func (`Callable`): A functions that accept group_call and source args.
 
         Returns:
             `Callable`: passed to args callback function.
         """
 
-        return self.add_handler(func, GroupCallAction.NETWORK_STATUS_CHANGED)
+        return self.add_handler(func, GroupCallAction.VIDEO_PLAYOUT_ENDED)
 
-    def on_participant_list_updated(self, func: Callable) -> Callable:
-        """When a list of participant will be updated.
+    def on_audio_playout_ended(self, func: Callable) -> Callable:
+        """When a audio playout will be ended.
 
         Args:
-            func (`Callable`): A functions that accept group_call and participants args.
-
-        Note:
-            The `participants` arg is a `list` of `GroupCallParticipantWrapper`.
-            It contains only updated participants! It's not a list of all participants!
+            func (`Callable`): A functions that accept group_call and source args.
 
         Returns:
             `Callable`: passed to args callback function.
         """
 
-        return self.add_handler(func, GroupCallAction.PARTICIPANT_LIST_UPDATED)
+        return self.add_handler(func, GroupCallAction.AUDIO_PLAYOUT_ENDED)
+
+    def on_media_playout_ended(self, func: Callable) -> Callable:
+        """When a audio or video playout will be ended.
+
+        Args:
+            func (`Callable`): A functions that accept group_call source and media type args.
+
+        Returns:
+            `Callable`: passed to args callback function.
+        """
+
+        return self.add_handler(func, GroupCallAction.MEDIA_PLAYOUT_ENDED)
+
+    # alias
+    on_playout_ended = on_media_playout_ended
 
 
-class GroupCall(ABC, GroupCallDispatcherMixin, GroupCallNative):
-    SEND_ACTION_UPDATE_EACH = 0.45
-    '''How often to send speaking action to chat'''
-
-    __ASYNCIO_TIMEOUT = 10
-
+class GroupCall(GroupCallRaw, GroupCallDispatcherMixin):
     def __init__(
         self,
         mtproto_bridge,
-        enable_logs_to_console: bool,
-        path_to_log_file: str,
-        outgoing_audio_bitrate_kbit: int,
+        enable_logs_to_console=False,
+        path_to_log_file=None,
+        outgoing_audio_bitrate_kbit=128,
     ):
-        GroupCallNative.__init__(
-            self,
-            self.__emit_join_payload_callback,
-            self.__network_state_updated_callback,
+        super().__init__(
+            mtproto_bridge,
+            self.__on_audio_played_data,
+            self.__on_audio_recorded_data,
+            self.__on_video_played_data,
             enable_logs_to_console,
             path_to_log_file,
             outgoing_audio_bitrate_kbit,
         )
-        GroupCallDispatcherMixin.__init__(self, GroupCallAction)
+        super(GroupCallDispatcherMixin, self).__init__(GroupCallAction)
 
-        self.mtproto = mtproto_bridge
-        self.mtproto.register_group_call_native_callback(
-            self._group_call_participants_update_callback, self._group_call_update_callback
-        )
+    def __trigger_on_video_playout_ended(self, source):
+        self.trigger_handlers(GroupCallAction.VIDEO_PLAYOUT_ENDED, self, source)
 
-        self.invite_hash = None
-        '''Hash from invite link to join as speaker'''
+    def __trigger_on_audio_playout_ended(self, source):
+        self.trigger_handlers(GroupCallAction.AUDIO_PLAYOUT_ENDED, self, source)
 
-        self.enable_action = True
-        '''Is enable sending of speaking action'''
+    def __trigger_on_media_playout_ended(self, source, media_type: MediaType):
+        self.trigger_handlers(GroupCallAction.MEDIA_PLAYOUT_ENDED, self, source, media_type)
 
-        self.is_connected = False
-        '''Is connected to voice chat via tgcalls'''
+    def __combined_video_trigger(self, source):
+        self.__trigger_on_video_playout_ended(source)
+        self.__trigger_on_media_playout_ended(source, MediaType.VIDEO)
 
-        self.__is_stop_requested = False
-        self.__emit_join_payload_event = None
+    def __combined_audio_trigger(self, source):
+        self.__trigger_on_audio_playout_ended(source)
+        self.__trigger_on_media_playout_ended(source, MediaType.AUDIO)
 
-        self.__is_muted = True
+    @staticmethod
+    def __on_video_played_data(self: 'GroupCallRaw') -> bytes:
+        if self._video_stream:
+            return self._video_stream.read()
 
-    async def _group_call_participants_update_callback(self, update: UpdateGroupCallParticipantsWrapper):
-        logger.debug('Group call participants update...')
-        logger.debug(update)
+    @staticmethod
+    def __on_audio_played_data(self: 'GroupCallRaw', length: int) -> bytes:
+        if self._audio_stream:
+            return self._audio_stream.read(length)
 
-        self.trigger_handlers(GroupCallAction.PARTICIPANT_LIST_UPDATED, self, update.participants)
+    @staticmethod
+    def __on_audio_recorded_data(self, data, length):
+        # TODO
+        pass
 
-        for participant in update.participants:
-            ssrc = uint_ssrc(participant.source)
+    async def join(self, group, join_as=None, invite_hash: Optional[str] = None, enable_action=True):
+        return await self.start(group, join_as, invite_hash, enable_action)
 
-            # maybe (if needed) set unmute status on server side after allowing to speak by admin
-            # also mb there is need a some delay after getting update cuz server sometimes cant handle editing properly
-            if participant.is_self and participant.can_self_unmute:
-                if not self.__is_muted:
-                    await self.edit_group_call(muted=False)
+    async def leave(self):
+        return await self.stop()
 
-            if participant.peer == self.mtproto.join_as and ssrc != self.mtproto.my_ssrc:
-                logger.debug(f'Not equal ssrc. Expected: {ssrc}. Actual: {self.mtproto.my_ssrc}.')
-                await self.reconnect()
-
-    async def _group_call_update_callback(self, update: UpdateGroupCallWrapper):
-        logger.debug('Group call update...')
-        logger.debug(update)
-
-        if isinstance(update.call, GroupCallDiscardedWrapper):
-            logger.debug('Group call discarded.')
-            await self.stop()
-        elif update.call.params:
-            self.__set_join_response_payload(update.call.params.data)
-
-    def __set_join_response_payload(self, payload):
-        logger.debug('Set join response payload...')
-
-        if self.__is_stop_requested:
-            logger.debug('Set payload rejected by a stop request.')
-            return
-
-        self._set_connection_mode(tgcalls.GroupConnectionMode.GroupConnectionModeRtc)
-        self._set_join_response_payload(payload)
-        logger.debug('Join response payload was set.')
-
-    def __emit_join_payload_callback(self, payload):
-        logger.debug('Emit join payload callback...')
-
-        if self.__is_stop_requested:
-            logger.debug('Join group call rejected by a stop request.')
-            return
-
-        if self.mtproto.group_call is None:
-            logger.debug('Group Call is None.')
-            return
-
-        async def _():
-            try:
-
-                def pre_update_processing():
-                    logger.debug(f'Set my ssrc to {payload.audioSsrc}.')
-                    self.mtproto.set_my_ssrc(payload.audioSsrc)
-
-                await self.mtproto.join_group_call(
-                    self.invite_hash, payload.json, muted=True, pre_update_processing=pre_update_processing
-                )
-
-                if self.__emit_join_payload_event:
-                    self.__emit_join_payload_event.set()
-
-                logger.debug(
-                    f'Successfully connected to VC with '
-                    f'ssrc={self.mtproto.my_ssrc} '
-                    f'as {type(self.mtproto.join_as).__name__}.'
-                )
-            except GroupcallSsrcDuplicateMuch:
-                logger.debug('Duplicate SSRC.')
-                await self.reconnect()
-
-        asyncio.ensure_future(_(), loop=self.mtproto.get_event_loop())
-
-    def __network_state_updated_callback(self, state: bool):
-        logger.debug('Network state updated...')
-
-        if self.is_connected == state:
-            logger.debug('Network state is same. Do nothing.')
-            return
-
-        self.is_connected = state
-        if self.is_connected:
-            asyncio.ensure_future(self.set_is_mute(False), loop=self.mtproto.get_event_loop())
-            if self.enable_action:
-                self.__start_status_worker()
-
-        self.trigger_handlers(GroupCallAction.NETWORK_STATUS_CHANGED, self, state)
-
-        logger.debug(f'New network state is {self.is_connected}.')
-
-    def __start_status_worker(self):
-        async def worker():
-            logger.debug('Start status (call action) worker...')
-            while self.is_connected:
-                await self.mtproto.send_speaking_group_call_action()
-                await asyncio.sleep(self.SEND_ACTION_UPDATE_EACH)
-
-        asyncio.ensure_future(worker(), loop=self.mtproto.get_event_loop())
-
-    async def start(self, group, join_as=None, invite_hash: Optional[str] = None, enable_action=True):
-        """Start voice chat (join and play/record from initial values).
+    async def start_video(
+        self, source: Optional[str] = None, with_audio=True, repeat=True, enable_experimental_lip_sync=False
+    ):
+        """Enable video playing for current group call.
 
         Note:
-            Disconnect from current voice chat and connect to the new one.
-            Multiple instances of `GroupCall` must be created for multiple voice chats at the same time.
-            Join as by default is personal account.
+            Source is video file or image file sequence or a
+            capturing device or a IP video stream for video capturing.
+
+            To use device camera you need to pass device index as int to the `source` arg.
 
         Args:
-            group (`InputPeerChannel` | `InputPeerChat` | `str` | `int`): Chat ID in any form.
-            join_as (`InputPeer` | `str` | `int`, optional): How to present yourself in participants list.
-            invite_hash (`str`, optional): Hash from speaker invite link.
-            enable_action (`bool`, optional): Is enables sending of speaking action.
+            source (`str`): Path to filename or device index or URL with some protocol. For example RTCP.
+            with_audio (`bool`): Get and play audio stream from video source.
+            repeat (`bool`): rewind video when end of file.
+            enable_experimental_lip_sync (`bool`): enable experimental lip sync feature.
         """
-        self.__is_stop_requested = False
-        self.enable_action = enable_action
 
-        group_call = await self.mtproto.get_and_set_group_call(group)
-        if group_call is None:
-            raise GroupCallNotFoundError('Chat without a voice chat')
+        if self._video_stream and self._video_stream.is_running:
+            self._video_stream.stop()
 
-        # mb move in other place. save plain join_as arg and use it in JoinGroupCall
-        # but for now it works  as optimization of requests
-        # we resolve join_as only when try to connect
-        # it doesnt call resolve on reconnect
-        await self.mtproto.resolve_and_set_join_as(join_as)
+        self._video_stream = VideoStream(source, repeat, self.__combined_video_trigger)
+        self._configure_video_capture(self._video_stream.get_video_info())
 
-        self.invite_hash = invite_hash
+        if with_audio:
+            await self.start_audio(source, repeat, self._video_stream if enable_experimental_lip_sync else None)
+        self._video_stream.start()
 
-        self.mtproto.re_register_update_handlers()
+        self._is_video_stopped = False
+        if self.is_connected:
+            await self.edit_group_call(video_stopped=False)
 
-        # when trying to connect to another chat or with another join_as
-        if self.is_group_call_native_created():
-            await self.reconnect()
-        # the first start
-        else:
-            self._setup_and_start_group_call()
+    async def start_audio(self, source: str, repeat=True, video_stream: Optional[VideoStream] = None):
+        """Enable audio playing for current group call.
 
-    async def stop(self):
-        """Properly stop tgcalls, remove MTProto handler, leave from server side."""
-        if not self.is_group_call_native_created():
-            logger.debug('Group call is not started, so there\'s nothing to stop.')
-            return
+        Note:
+            Source is audio file or direct URL to file or audio live stream..
 
-        self.__is_stop_requested = True
-        logger.debug('Stop requested.')
+        Args:
+            source (`str`): Path to filename or URL to audio file or URL to live stream.
+            repeat (`bool`): rewind audio when end of file.
+            video_stream (`VideoStream`): stream to sync.
+        """
 
-        self.mtproto.unregister_update_handlers()
-        # to bypass recreating of outgoing audio channel
-        self._set_is_mute(True)
-        self._set_connection_mode(tgcalls.GroupConnectionMode.GroupConnectionModeNone)
+        if self._audio_stream and self._audio_stream.is_running:
+            self._audio_stream.stop()
 
-        on_disconnect_event = asyncio.Event()
-
-        async def post_disconnect():
-            await self.leave_current_group_call()
-            self.mtproto.reset()
-            self.__is_stop_requested = False
-
-        async def on_disconnect(obj, is_connected):
-            if is_connected:
-                return
-
-            obj._stop_audio_device_module()
-
-            # need for normal waiting of stopping audio devices
-            # destroying of webrtc client during .stop not needed yet
-            # because we a working in the same native instance
-            # and can reuse tis client for another connections.
-            # In any case now its possible to reset group call ptr
-            # self.__native_instance.stopGroupCall()
-
-            await post_disconnect()
-
-            obj.remove_handler(on_disconnect, GroupCallAction.NETWORK_STATUS_CHANGED)
-            on_disconnect_event.set()
+        self._audio_stream = AudioStream(
+            source, repeat, self.__combined_audio_trigger, video_stream=video_stream
+        ).start()
 
         if self.is_connected:
-            self.add_handler(on_disconnect, GroupCallAction.NETWORK_STATUS_CHANGED)
-            await asyncio.wait_for(on_disconnect_event.wait(), timeout=self.__ASYNCIO_TIMEOUT)
-        else:
-            await post_disconnect()
+            await self.edit_group_call(muted=False)
 
-        logger.debug('GroupCall stopped properly.')
+    async def start_audio_record(self, path):
+        # TODO
+        pass
 
-    async def reconnect(self):
-        """Connect to voice chat using the same native instance."""
-        logger.debug('Reconnecting...')
-        if not self.mtproto.group_call:
-            raise NotConnectedError("You don't connected to voice chat.")
+    async def set_video_pause(self, pause: bool, with_mtproto=True):
+        self._is_video_paused = pause
+        if self.is_connected and with_mtproto:
+            await self.edit_group_call(video_paused=pause)
+        if self._video_stream:
+            self._video_stream.set_pause(pause)
 
-        self._set_connection_mode(tgcalls.GroupConnectionMode.GroupConnectionModeNone)
-        self._emit_join_payload(self.__emit_join_payload_callback)
+    async def set_audio_pause(self, pause: bool, with_mtproto=True):
+        self._is_muted = pause
+        if self.is_connected and with_mtproto:
+            await self.edit_group_call(muted=pause)
+        if self._audio_stream:
+            self._audio_stream.set_pause(pause)
 
-        # during the .stop we stop audio device module. Need to restart
-        self.restart_recording()
-        self.restart_playout()
+    async def set_pause(self, pause: bool):
+        await self.set_video_pause(pause, False)
+        await self.set_audio_pause(pause, False)
 
-        # cuz native instance doesnt block python
-        self.__emit_join_payload_event = asyncio.Event()
-        await asyncio.wait_for(self.__emit_join_payload_event.wait(), timeout=self.__ASYNCIO_TIMEOUT)
+        if self.is_connected:
+            # optimize 2 queries into 1
+            await self.edit_group_call(muted=pause, video_paused=pause)
 
-    async def leave_current_group_call(self):
-        """Leave group call from server side (MTProto part)."""
-        logger.debug('Try to leave the current group call...')
-        try:
-            await self.mtproto.leave_current_group_call()
-        except Exception as e:
-            logger.warning("Couldn't leave the group call. But no worries, you'll get removed from it in seconds.")
-            logger.debug(e)
-        else:
-            logger.debug('Completely left the current group call.')
+    async def stop_audio(self, with_mtproto=True):
+        if self._audio_stream and self._audio_stream.is_running:
+            self._audio_stream.stop()
 
-    async def edit_group_call(self, volume: int = None, muted=False):
-        """Edit own settings of group call.
+        if self.is_connected and with_mtproto:
+            await self.edit_group_call(muted=True)
 
-        Note:
-            There is bug where you can try to pass `volume=100`.
+    async def stop_video(self, with_mtproto=True):
+        if self._video_stream and self._video_stream.is_running:
+            self._video_stream.stop()
 
-        Args:
-            volume (`int`): Volume.
-            muted (`bool`): Is muted.
-        """
+        if self.is_connected and with_mtproto:
+            await self.edit_group_call(video_stopped=True)
 
-        await self.edit_group_call_member(self.mtproto.join_as, volume, muted)
+    async def stop_media(self):
+        await self.stop_video(False)
+        await self.stop_audio(False)
 
-    async def edit_group_call_member(self, peer, volume: int = None, muted=False):
-        """Edit setting of user in voice chat (required voice chat management permission).
-
-        Note:
-            There is bug where you can try to pass `volume=100`.
-
-        Args:
-            peer (`InputPeer`): Participant of voice chat.
-            volume (`int`): Volume.
-            muted (`bool`): Is muted.
-        """
-
-        volume = max(1, volume * 100) if volume is not None else None
-        await self.mtproto.edit_group_call_member(peer, volume, muted)
-
-    async def set_is_mute(self, is_muted: bool):
-        """Set is mute.
-
-        Args:
-            is_muted (`bool`): Is muted.
-        """
-
-        self.__is_muted = is_muted
-        self._set_is_mute(is_muted)
-
-        logger.debug(f'Set is muted on server side. New value: {is_muted}.')
-        await self.edit_group_call(muted=is_muted)
-
-    async def set_my_volume(self, volume):
-        """Set volume for current client.
-
-        Note:
-            Volume value only can be in 1-200 range. There is auto normalization.
-
-        Args:
-            volume (`int` | `str` | `float`): Volume.
-        """
-        # Required "Manage Voice Chats" admin permission
-
-        volume = max(1, min(int(volume), 200))
-        logger.debug(f'Set volume to: {volume}.')
-
-        await self.edit_group_call(volume)
-        self._set_volume(uint_ssrc(self.mtproto.my_ssrc), volume / 100)
-
-    # shortcuts for easy access in callbacks of events
+        if self.is_connected:
+            # optimize 2 queries into 1
+            await self.edit_group_call(video_stopped=True, muted=True)
 
     @property
-    def client(self):
-        return self.mtproto.client
+    def is_video_paused(self):
+        return self._video_stream and self._video_stream.is_paused
 
     @property
-    def full_chat(self):
-        return self.mtproto.full_chat
+    def is_audio_paused(self):
+        return self._audio_stream and self._audio_stream.is_paused
 
     @property
-    def chat_peer(self):
-        return self.mtproto.chat_peer
+    def is_paused(self):
+        return self.is_video_paused and self.is_audio_paused
 
     @property
-    def group_call(self):
-        return self.mtproto.group_call
+    def is_video_running(self):
+        return self._video_stream and self._video_stream.is_running
 
     @property
-    def my_ssrc(self):
-        return self.mtproto.my_ssrc
+    def is_audio_running(self):
+        return self._audio_stream and self._audio_stream.is_running
 
     @property
-    def my_peer(self):
-        return self.mtproto.my_peer
-
-    @property
-    def join_as(self):
-        return self.mtproto.join_as
+    def is_running(self):
+        return self.is_video_running and self.is_audio_running

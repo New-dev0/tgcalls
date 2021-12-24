@@ -26,7 +26,12 @@ from pyrogram.errors import (
 )
 from pyrogram.handlers import RawUpdateHandler
 from pyrogram.raw import functions, types
-from pyrogram.raw.types import GroupCallDiscarded as PyrogramGroupCallDiscarded, InputPeerChannel, InputPeerChat
+from pyrogram.raw.types import (
+    GroupCallDiscarded as PyrogramGroupCallDiscarded,
+    InputPeerChannel,
+    InputPeerChat,
+    UpdateGroupCallConnection,
+)
 from pyrogram.utils import get_peer_id
 
 from pytgcalls import PytgcallsError
@@ -69,12 +74,18 @@ class PyrogramBridge(MTProtoBridgeBase):
         await self.group_call_participants_update_callback(wrapped_update)
 
     async def _process_group_call_update(self, update):
-        if isinstance(update.call, PyrogramGroupCallDiscarded):
-            call = GroupCallDiscardedWrapper()  # no info needed
-        else:
-            call = GroupCallWrapper(update.call.id, update.call.params)
+        if not isinstance(update.call, PyrogramGroupCallDiscarded):
+            return
 
+        call = GroupCallDiscardedWrapper()  # no info needed
         wrapped_update = UpdateGroupCallWrapper(update.chat_id, call)
+
+        await self.group_call_update_callback(wrapped_update)
+
+    async def _process_group_call_connection(self, update):
+        # TODO update to new layer when pyrogram will release new stable version on pypi
+        call = GroupCallWrapper('placeholder', update.params)
+        wrapped_update = UpdateGroupCallWrapper('placeholder', call)
 
         await self.group_call_update_callback(wrapped_update)
 
@@ -103,13 +114,17 @@ class PyrogramBridge(MTProtoBridgeBase):
         )
         await self.client.handle_updates(response)
 
-    async def edit_group_call_member(self, peer, volume: int = None, muted=False):
+    async def edit_group_call_member(
+        self, peer, volume: int = None, muted=False, video_stopped=True, video_paused=False
+    ):
         response = await self.client.send(
             functions.phone.EditGroupCallParticipant(
                 call=self.full_chat.call,
                 participant=peer,
                 muted=muted,
                 volume=volume,
+                video_stopped=video_stopped,
+                video_paused=video_paused,
             )
         )
         await self.client.handle_updates(response)
@@ -181,7 +196,9 @@ class PyrogramBridge(MTProtoBridgeBase):
             functions.messages.SetTyping(peer=self.chat_peer, action=types.SpeakingInGroupCallAction())
         )
 
-    async def join_group_call(self, invite_hash: str, params: str, muted: bool, pre_update_processing: Callable):
+    async def join_group_call(
+        self, invite_hash: str, params: str, muted: bool, video_stopped: bool, pre_update_processing: Callable
+    ):
         try:
             response = await self.client.send(
                 functions.phone.JoinGroupCall(
@@ -190,10 +207,16 @@ class PyrogramBridge(MTProtoBridgeBase):
                     invite_hash=invite_hash,
                     params=types.DataJSON(data=params),
                     muted=muted,
+                    video_stopped=video_stopped,
                 )
             )
 
             pre_update_processing()
+
+            # it is here cuz we need to associate params for connection with group call
+            for update in response.updates:
+                if isinstance(update, UpdateGroupCallConnection):
+                    await self._process_group_call_connection(update)
 
             await self.client.handle_updates(response)
         except PyrogramGroupcallSsrcDuplicateMuch as e:
